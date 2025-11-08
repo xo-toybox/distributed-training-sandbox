@@ -1,0 +1,6 @@
+-r requirements.image.txt
+
+modal>=1.2.1
+nbdistributed @ git+https://github.com/muellerzr/nbdistributed
+torch-tb-profiler>=0.4.3
+uv>=0.4.17
