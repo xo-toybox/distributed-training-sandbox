@@ -11,3 +11,4 @@ tensorboard --logdir ddp_traces
 - 20251108-044053-bs64: 95.76% utilization, 84.4% SM efficiency, 49.1% occupancy
 - 20251108-043817-bs128: OOM
 
+fused kernels

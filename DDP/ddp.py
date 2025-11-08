@@ -96,7 +96,7 @@ def collate_func(batch):
         return_tensors="pt",
     )
 
-per_device_batch_size = 32
+per_device_batch_size = 32 # tuned for A10G 24GB
 
 # do initial shuffle
 train_ds = dataset.shuffle(seed=42)
