@@ -2,6 +2,7 @@
 Implements basic ZeRO-1 (optimizer sharding) with torch profiling
 """
 
+import os
 import sys
 from pathlib import Path
 import time
@@ -185,6 +186,11 @@ def test_zero1():
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
+    # Get trace directory from environment variable
+    trace_dir = os.environ.get("TRACE_DIR", "./profiler_traces")
+    trace_path = Path(trace_dir)
+    trace_path.mkdir(parents=True, exist_ok=True)
+
     # Setup profiler for regular Adam (only on rank 0)
     profiler_context = None
     if rank == 0:
@@ -198,7 +204,7 @@ def test_zero1():
         profiler_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=profiler_schedule,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_traces/regular_adam"),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_path / "regular_adam")),
             record_shapes=True,
             profile_memory=True,
             with_stack=True,
@@ -252,7 +258,7 @@ def test_zero1():
         profiler_context_zero = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=profiler_schedule,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_traces/zero1_adam"),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_path / "zero1_adam")),
             record_shapes=True,
             profile_memory=True,
             with_stack=True,
@@ -297,9 +303,9 @@ def test_zero1():
             f"Memory reduction: {(peak_memory_adam - peak_memory_z1):.2f} MB ({((peak_memory_adam - peak_memory_z1) / peak_memory_adam * 100):.2f}%)"
         )
         print("\nProfiler traces saved to:")
-        print("  - ./profiler_traces/regular_adam")
-        print("  - ./profiler_traces/zero1_adam")
-        print("\nView with: tensorboard --logdir=./profiler_traces")
+        print(f"  - {trace_path / 'regular_adam'}")
+        print(f"  - {trace_path / 'zero1_adam'}")
+        print(f"\nView with: tensorboard --logdir={trace_path}")
 
 
 if __name__ == "__main__":

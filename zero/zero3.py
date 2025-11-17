@@ -2,6 +2,7 @@
 Implements basic ZeRO-3 (optimizer, grad, and param sharding with hooks)
 """
 
+import os
 import sys
 from pathlib import Path
 import time
@@ -15,6 +16,7 @@ from torch.optim import Adam, Optimizer
 sys.path.append(str(Path(__file__).parent.parent))
 from training_utils.memory import print_memory_stats
 from training_utils.utils import get, set_seed
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 set_seed(42)
 
@@ -166,11 +168,13 @@ class ShardedOptimizer:
         self.optimizer.zero_grad()
 
 
-def train(model, optimizer, device, is_sharded=False):
+def train(model, optimizer, device, is_sharded=False, profiler_context=None):
     rank = get("rank")
     batch_size = 16
-    x = torch.randn(batch_size, 10000, device=device)
-    y = torch.randn(batch_size, 10000, device=device)
+
+    with record_function("data_generation"):
+        x = torch.randn(batch_size, 10000, device=device)
+        y = torch.randn(batch_size, 10000, device=device)
 
     # Register ZeRO-3 hooks if sharded
     if is_sharded:
@@ -194,31 +198,62 @@ def train(model, optimizer, device, is_sharded=False):
     dist.barrier()
 
     peak_memories = []
-    for i in range(10):
+    num_steps = 20  # More steps for better profiling
+
+    for i in range(num_steps):
+        if i > num_steps:
+            break
+
         torch.cuda.reset_peak_memory_stats(device)
-        optimizer.zero_grad()
-        output = model(x)
-        loss = nn.functional.mse_loss(output, y)
+
+        with record_function("zero_grad"):
+            optimizer.zero_grad()
+
+        with record_function("forward"):
+            output = model(x)
+            loss = nn.functional.mse_loss(output, y)
+
         if rank == 0 and i == 0:
             print(f"\nStep {i} memory:")
             print(f"Before backward: {torch.cuda.memory_allocated(device)/1024**2:.2f} MB")
-        loss.backward()
-        torch.cuda.synchronize()
+
+        with record_function("backward"):
+            loss.backward()
+            torch.cuda.synchronize()
+
         if rank == 0 and i == 0:
             grad_memory = sum(
                 p.grad.numel() * p.grad.element_size() / 1024**2
                 for p in model.parameters() if p.grad is not None
             )
             print(f"Gradient memory after backward: {grad_memory:.2f} MB")
-        optimizer.step()
+
+        with record_function("optimizer_step_total"):
+            optimizer.step()
+
+        if profiler_context:
+            profiler_context.step()
+
         current_peak = torch.cuda.max_memory_allocated(device) / 1024**2
         peak_memories.append(current_peak)
+
         if rank == 0 and i == 0:
             print(f"Peak memory this step: {current_peak:.2f} MB")
         dist.barrier()
 
     if rank == 0:
         print(f"\nFinal peak memory: {max(peak_memories):.2f} MB")
+
+    # Add timing stats at the end
+    if is_sharded and rank == 0:
+        avg_step_time = optimizer.step_time / num_steps
+        avg_comm_time = optimizer.communication_time / num_steps
+        print("\nTiming and Communication Stats:")
+        print("-" * 40)
+        print(f"Average step time: {avg_step_time:.3f}s")
+        print(f"Average communication time: {avg_comm_time:.3f}s")
+        print(f"Average compute time: {avg_step_time - avg_comm_time:.3f}s")
+        print(f"Communication overhead: {(avg_comm_time / avg_step_time) * 100:.1f}%")
 
     return model, optimizer, max(peak_memories)
 
@@ -230,6 +265,32 @@ def test_zero3():
     torch.cuda.set_device(device)
 
     set_seed(42)
+
+    # Get trace directory from environment variable
+    trace_dir = os.environ.get("TRACE_DIR", "./profiler_traces")
+    trace_path = Path(trace_dir)
+    trace_path.mkdir(parents=True, exist_ok=True)
+
+    # Setup profiler for regular Adam (only on rank 0)
+    profiler_context = None
+    if rank == 0:
+        profiler_schedule = schedule(
+            skip_first=5,
+            wait=1,
+            warmup=2,
+            active=5,
+            repeat=1
+        )
+        profiler_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_path / "regular_adam")),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True
+        )
+
     # Test with regular Adam
     print(f"\nGPU {rank} - Testing with regular Adam:")
     torch.cuda.reset_peak_memory_stats()
@@ -247,15 +308,42 @@ def test_zero3():
         nn.Linear(10_000, 10_000),
     ).to(device)
     regular_optimizer = Adam(model.parameters(), lr=0.001)
+
+    if profiler_context:
+        profiler_context.__enter__()
+
     model, regular_optimizer, peak_memory_adam = train(
-        model, regular_optimizer, device, is_sharded=False
+        model, regular_optimizer, device, is_sharded=False, profiler_context=profiler_context
     )
+
+    if profiler_context:
+        profiler_context.__exit__(None, None, None)
 
     # Clear memory before testing sharded optimizer
     del model, regular_optimizer
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     dist.barrier()
+
+    # Setup profiler for ZeRO-3 (only on rank 0)
+    profiler_context_zero = None
+    if rank == 0:
+        profiler_schedule = schedule(
+            skip_first=5,
+            wait=1,
+            warmup=2,
+            active=5,
+            repeat=1
+        )
+        profiler_context_zero = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_path / "zero3_adam")),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True
+        )
 
     print(f"\nGPU {rank} - Testing with ZeRO-3 Sharded Adam:")
     model = nn.Sequential(
@@ -274,19 +362,31 @@ def test_zero3():
 
     base_optimizer = Adam(model.parameters(), lr=0.001)
     sharded_optimizer = ShardedOptimizer(base_optimizer)
+
+    if profiler_context_zero:
+        profiler_context_zero.__enter__()
+
     model, sharded_optimizer, peak_memory_z3 = train(
-        model, sharded_optimizer, device, is_sharded=True
+        model, sharded_optimizer, device, is_sharded=True, profiler_context=profiler_context_zero
     )
+
+    if profiler_context_zero:
+        profiler_context_zero.__exit__(None, None, None)
 
     # Print final memory comparison
     if rank == 0:
         print("\nMemory Usage Summary:")
         print("-" * 40)
         print(f"Peak memory with regular Adam: {peak_memory_adam:.2f} MB")
-        print(f"Peak memory with sharded Adam: {peak_memory_z3:.2f} MB")
+        print(f"Peak memory with ZeRO-3 (full sharding): {peak_memory_z3:.2f} MB")
         print(
             f"Memory reduction: {(peak_memory_adam - peak_memory_z3):.2f} MB ({((peak_memory_adam - peak_memory_z3) / peak_memory_adam * 100):.2f}%)"
         )
+        print("\nProfiler traces saved to:")
+        print(f"  - {trace_path / 'regular_adam'}")
+        print(f"  - {trace_path / 'zero3_adam'}")
+        print(f"\nView with: tensorboard --logdir={trace_path}")
+
     torch.distributed.destroy_process_group()
 
 

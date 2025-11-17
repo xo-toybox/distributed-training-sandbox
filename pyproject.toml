@@ -15,6 +15,8 @@ dependencies = [
     "torchvision==0.19.1",
     "transformers>=4.44.2",
     "torch-tb-profiler>=0.4.3",
+    "pyyaml>=6.0.3",
+    "tensorboard-plugin-profile>=2.21.1",
 ]
 
 [tool.uv.sources]
