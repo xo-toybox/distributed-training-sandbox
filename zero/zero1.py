@@ -1,5 +1,25 @@
 """
 Implements basic ZeRO-1 (optimizer sharding) with torch profiling
+
+2 separate runs: baseline (standard Adam) and sharded (standard Adam wrapped in ShardedOptimizer).
+
+The Setup
+1. Initializes distribution training: `torch.distributed.init_process_group("nccl")` and sets the rank and world size.
+    - Setup profiler scheduler on rank 0: start at 8 (skip_first + wait + warmup), active for 5, repeat 1 (8,9,10,11,12).
+2. Builds a synthetic MLP (6 layer stack of 10k x 10k Linear + ReLU).
+3. Runs dummy data generation and warmup training step to avoid first-step overhead. 
+    - `record_function` blocks for "data_generation".
+    - Prints initial state memory stats (before training loop, after warmup step).
+4. Runs a short synthetic MSE training loop (20 steps for better profiling). 
+    - Profiles memory and step structure with `torch.profiler`. 
+      `record_function` blocks for per-step: forward, backward, optimizer_step_total, and zero_grad.
+    - Prints peak memory per step and final.
+
+Communications: within each training step
+- dist.barrier() at the end of each step to ensure profiling captures each step independently
+- ShardedOptimizer: within optimizer.step()
+    - all_reduce_gradients
+    - broadcast_parameters
 """
 
 import os

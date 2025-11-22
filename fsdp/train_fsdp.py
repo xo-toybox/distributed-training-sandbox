@@ -1,3 +1,6 @@
+# Pretraining on 5% of TinyStories dataset (100k samples)
+
+
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,10 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Minimal example of training with FP8 precision using FSDP2 via Accelerate.
-This example demonstrates how to use torchao's Float8LinearConfig with Accelerate's AORecipeKwargs.
-"""
 
 import argparse
 
@@ -61,16 +60,18 @@ def main():
 
     model = AutoModelForCausalLM.from_config(
         AutoConfig.from_pretrained(MODEL_ID, use_cache=False),
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # TinyStories dataset: 5% (100k) samples: packed sequences for pretraining
     dataset = get_dataset(tokenizer, args.sequence_length, accelerator)
     dataloader = DataLoader(dataset, batch_size=1, collate_fn=create_collate_fn())
 
+    # Wraps the dataloader to handle distributed data sampling and automatic device placement
     dataloader = accelerator.prepare(dataloader)
     accelerator.wait_for_everyone()
 
@@ -102,16 +103,62 @@ def main():
     model_flops_per_token = get_model_flops_per_token(model, args.sequence_length)
     performance_tracker = PerformanceTracker(warmup_steps=5)
 
+    # Setup memory profiling with TensorBoard integration (rank 0 only)
+    from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+    import os
+    from pathlib import Path
+
+    # Profile directory: /root/traces/{run_id}/profiler
+    trace_dir = os.environ.get("TRACE_DIR", "/root/traces")
+    trace_path = Path(trace_dir)
+    trace_path.mkdir(parents=True, exist_ok=True)
+
+    # Only profile on rank 0 to avoid duplicate traces
+    prof = None
+    if accelerator.is_main_process:
+        profile_dir = trace_path / "fsdp_training"
+
+        accelerator.print(f"Profiler traces will be saved to: {profile_dir}")
+
+        # Configure profiler schedule
+        # Need to ensure active_steps leaves room for at least one step after to trigger trace writing
+        wait_steps = 5
+        warmup_steps = 5
+        active_steps = min(10, max(1, args.num_steps - wait_steps - warmup_steps - 1))
+
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            on_trace_ready=tensorboard_trace_handler(str(profile_dir)),
+            schedule=torch.profiler.schedule(wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=1)
+        )
+        prof.start()
+
     for step, batch in enumerate(dataloader):
         if step >= total_num_steps:
             break
 
-        outputs = model(**batch)
-        loss = outputs.loss
+        with record_function("forward"):
+            # FSDP2 forward: 
+            #   all-gather at each decoder layer (small bump in memory) and reshards
+            #   per layer activations are stored (not optimized out to CPU) - high across 36 layers
+            #   final log probs are stored (high memory) in addition to scalar CE loss
+            outputs = model(**batch)
+            loss = outputs.loss
 
-        accelerator.backward(loss)
-        optimizer.step()
-        optimizer.zero_grad()
+        with record_function("backward"):
+            # FSDP2 backward: 
+            #   full gradient buffer (high memory)
+            #   all-gather impact here is minimal
+            accelerator.backward(loss)
+
+        with record_function("optimizer_step"):
+            optimizer.step()
+            optimizer.zero_grad()
+
         metrics = performance_tracker.step(batch["input_ids"].shape[1], model_flops_per_token)
 
         print_msg = f"Step {step}/{total_num_steps}, Loss: {loss.item():.4f}"
@@ -124,6 +171,12 @@ def main():
             accelerator.print(print_msg)
 
         accelerator.log(metrics)
+
+        if prof:
+            prof.step()
+
+    if prof:
+        prof.stop()
 
     accelerator.wait_for_everyone()
     accelerator.end_training()

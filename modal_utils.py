@@ -227,11 +227,18 @@ def create_modal_app(config_path):
         num_processes: int | None = None,
         run_name: str | None = None,
         script: str | None = None,
+        num_steps: int | None = None,
     ) -> str:
         # If script is provided, update config
         if script:
             config.training_script = script
-        return run_training(config, num_processes, run_name)
+
+        # Build extra args for training script
+        extra_args = []
+        if num_steps is not None:
+            extra_args.extend(["--num-steps", str(num_steps)])
+
+        return run_training(config, num_processes, run_name, extra_args)
 
     # Note: local_entrypoint is defined at global scope (bottom of file)
     # to satisfy Modal's requirement for global scope functions

@@ -6,17 +6,18 @@ Config-driven distributed training for DDP, FSDP, ZeRO.
 
 ```bash
 # Run training
-modal run zero/modal_app.py --script zero2.py --run-name my-exp
-modal run fsdp/modal_app.py --run-name my-exp
+modal run zero/modal_app.py --script zero2.py --run-name zero2
+modal run fsdp/modal_app.py --run-name fsdp
 
 # Download profiler traces
 # Single run (get run-id from output above)
-modal volume get zero-traces <run-id> ./traces/zero/<run-id>
+modal volume get zero-traces <run-id> ./zero/traces/<run-id>
 # All runs
-modal volume get zero-traces / ./traces/zero/
+modal volume get fsdp-traces / ./fsdp/traces/
 
 # View with TensorBoard
-tensorboard --logdir ./traces/zero/  # Compares all runs
+tensorboard --logdir ./traces/fsdp/  # Compares all runs
+# View large traces with ui.perfetto.dev
 ```
 
 ## Structure
