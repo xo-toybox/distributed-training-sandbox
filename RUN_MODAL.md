@@ -1,54 +1,49 @@
 # Modal Deployment
 
-Config-driven distributed training for DDP, FSDP, ZeRO.
+Config-driven distributed training for FSDP, ZeRO, Pipeline Parallelism, and FP8.
 
 ## Usage
 
 ```bash
-# Run training
+# ZeRO
 modal run zero/modal_app.py --script zero2.py --run-name zero2
+
+
+# FSDP
 modal run fsdp/modal_app.py --run-name fsdp
 
-# Download profiler traces
-# Single run (get run-id from output above)
-modal volume get zero-traces <run-id> ./zero/traces/<run-id>
-# All runs
 modal volume get fsdp-traces / ./fsdp/traces/
-
-# View with TensorBoard
+# modal volume get fsdp-traces <run-id> ./fsdp/traces/<run-id>
 tensorboard --logdir ./traces/fsdp/  # Compares all runs
 # View large traces with ui.perfetto.dev
+
+
+# Pipeline Parallelism
+modal run pp/modal_app.py
+
+
+# FP8 (requires H100)
+modal run fp8/modal_app.py::sweep
+
+
 ```
+
+## Strategies
+
+| Directory | Strategy | GPUs |
+|-----------|----------|------|
+| `fsdp/` | Fully Sharded Data Parallel | A100-80GB:2 |
+| `zero/` | ZeRO-1/2/3 | A10G:2 |
+| `pp/` | Pipeline Parallelism | A100-80GB:2 |
+| `fp8/` | FP8 Training | H100:2 |
 
 ## Structure
 
-Each strategy has:
+Each directory has:
 - `modal_app.py` - config + launcher in one file
 - `requirements.txt` - dependencies
 
 Shared infrastructure in `modal_utils.py`.
-
-## Config Example
-
-`zero/modal_app.py` (config embedded as Python dict):
-```python
-config = {
-    "app": {"name": "zero-training", "training_script": "zero1.py"},
-    "gpu": {"default_spec": "A10G:2"},
-    "launcher": {"type": "torchrun"},
-    "entrypoint": {"script_options": ["zero1.py", "zero2.py", "zero3.py"]},
-}
-app, _, _ = create_modal_app(config)
-```
-
-## Add New Strategy
-
-```bash
-# Copy template
-cp zero/modal_app.py my_strategy/modal_app.py
-# Edit config dict in my_strategy/modal_app.py
-modal run my_strategy/modal_app.py
-```
 
 ## Configuration
 

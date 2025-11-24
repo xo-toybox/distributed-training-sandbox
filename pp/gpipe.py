@@ -1,8 +1,14 @@
 """
 Implements GPipe Pipeline Parallelism
 
-In GPipe, all microbatches go through all forward passes first,
-then all backward passes are executed.
+GPipe uses an all-forward-then-all-backward schedule for pipeline parallelism.
+All microbatches complete forward passes through all stages before any backward pass begins.
+
+Trade-off vs 1F1B: same pipeline bubble
++ Simpler scheduling logic
+- Higher peak memory (~n_microbatches vs ~n_stages activations)
+
+See 1f1b.py for a more memory-efficient alternative.
 """
 
 from accelerate.utils import set_seed
@@ -147,8 +153,72 @@ def run_pipe(inputs, targets):
     return loss_total / loss_count if loss_count else None
 
 if __name__ == "__main__":
-    for epoch in range(10):
+    import argparse
+    import time
+    import json
+
+    parser = argparse.ArgumentParser(description="GPipe Pipeline Parallelism Training")
+    parser.add_argument("--num-epochs", type=int, default=10, help="Number of training epochs")
+    args = parser.parse_args()
+
+    losses = []
+    epoch_times = []
+
+    # Track peak memory per GPU
+    torch.cuda.reset_peak_memory_stats()
+
+    print(f"[GPipe] Starting training for {args.num_epochs} epochs")
+    print(f"[GPipe] Config: {n_stages} stages, {n_micro} microbatches, batch_size={batch_size}")
+
+    start_time = time.time()
+    for epoch in range(args.num_epochs):
         x = torch.randn(batch_size, 50)
         y = torch.randn(batch_size, 50)
+
+        for i in range(n_stages):
+            torch.cuda.synchronize(i)
+        epoch_start = time.time()
+
         loss = run_pipe(x, y)
-        print(f"epoch {epoch}: loss = {loss:.4f}")
+
+        for i in range(n_stages):
+            torch.cuda.synchronize(i)
+        epoch_end = time.time()
+
+        epoch_time = epoch_end - epoch_start
+        losses.append(loss)
+        epoch_times.append(epoch_time)
+
+        if epoch % max(1, args.num_epochs // 10) == 0 or epoch == args.num_epochs - 1:
+            print(f"[GPipe] epoch {epoch}/{args.num_epochs}: loss={loss:.6f}, time={epoch_time:.3f}s")
+
+    total_time = time.time() - start_time
+
+    # Get peak memory for each GPU
+    peak_memory_mb = {i: torch.cuda.max_memory_allocated(i) / 1024**2 for i in range(n_stages)}
+
+    # Calculate metrics
+    avg_loss = sum(losses) / len(losses)
+    avg_epoch_time = sum(epoch_times) / len(epoch_times)
+
+    # Output results
+    results = {
+        "strategy": "GPipe",
+        "num_epochs": args.num_epochs,
+        "n_stages": n_stages,
+        "n_microbatches": n_micro,
+        "batch_size": batch_size,
+        "final_loss": losses[-1],
+        "avg_loss": avg_loss,
+        "total_time_sec": total_time,
+        "avg_epoch_time_sec": avg_epoch_time,
+        "throughput_epochs_per_sec": 1 / avg_epoch_time,
+        "peak_memory_mb": peak_memory_mb,
+        "total_peak_memory_mb": sum(peak_memory_mb.values()),
+    }
+
+    print("\n" + "="*60)
+    print("GPIPE RESULTS")
+    print("="*60)
+    print(json.dumps(results, indent=2))
+    print("="*60)

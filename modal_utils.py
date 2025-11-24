@@ -167,19 +167,12 @@ def run_training(
             f"({gpu_count}). Set `MODAL_GPU_SPEC` or the flag so they match."
         )
 
-    # Create run ID and trace directory
+    # Create run ID
     run_id = build_run_id(run_name)
-    trace_root = Path(config.remote_trace_path) / run_id
-    trace_root.mkdir(parents=True, exist_ok=True)
 
     # Setup environment
     env = os.environ.copy()
-    env.update(
-        {
-            "TRACE_DIR": str(trace_root),
-            "TOKENIZERS_PARALLELISM": env.get("TOKENIZERS_PARALLELISM", "false"),
-        }
-    )
+    env.update({"TOKENIZERS_PARALLELISM": env.get("TOKENIZERS_PARALLELISM", "false")})
 
     # Add any additional env vars from config
     additional_env = config.launcher.get("env", {})
@@ -192,7 +185,6 @@ def run_training(
     print(f"Launching training with command: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, cwd=config.remote_code_path, env=env)
 
-    print(f"Training complete. Traces stored at volume '{config.trace_volume_name}' in {run_id}")
     return run_id
 
 
@@ -228,17 +220,25 @@ def create_modal_app(config_path):
         run_name: str | None = None,
         script: str | None = None,
         num_steps: int | None = None,
+        num_epochs: int | None = None,
+        extra_args: list[str] | None = None,
     ) -> str:
         # If script is provided, update config
         if script:
             config.training_script = script
 
         # Build extra args for training script
-        extra_args = []
+        combined_args = []
         if num_steps is not None:
-            extra_args.extend(["--num-steps", str(num_steps)])
+            combined_args.extend(["--num-steps", str(num_steps)])
+        if num_epochs is not None:
+            combined_args.extend(["--num-epochs", str(num_epochs)])
 
-        return run_training(config, num_processes, run_name, extra_args)
+        # Add any additional args passed in
+        if extra_args:
+            combined_args.extend(extra_args)
+
+        return run_training(config, num_processes, run_name, combined_args)
 
     # Note: local_entrypoint is defined at global scope (bottom of file)
     # to satisfy Modal's requirement for global scope functions

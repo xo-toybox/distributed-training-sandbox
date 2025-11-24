@@ -1,10 +1,20 @@
 """
-Implements One-Forward-One-Backward PP
+Implements One-Forward-One-Backward (1F1B) Pipeline Parallelism
 
-Kinds include:
-1. GPipe (All forward -> all backward)
-2. 1F1B (One forward, one backward)
-3. Interleaved 1F1B 
+1F1B interleaves forward and backward passes to reduce memory usage and pipeline bubbles.
+Unlike GPipe (all-forward then all-backward), 1F1B starts backward passes as soon as
+the pipeline fills, allowing activations to be freed earlier.
+
+Key characteristics:
+- Clock-based scheduler: runs for (n_microbatches + n_stages - 1) ticks
+- Each tick: all stages attempt both forward (if input ready) and backward (if grad ready)
+- Memory efficient: activations freed sooner vs GPipe (peak ~n_stages microbatches vs ~n_microbatches)
+- Same pipeline bubble as GPipe: 2*(n_stages-1), but better memory-time trade-off
+
+Pipeline Parallelism Variants:
+1. GPipe (All forward -> all backward) - see gpipe.py
+2. 1F1B (One forward, one backward) - this implementation
+3. Interleaved 1F1B (multiple stages per device)
 4. Fill-Drain (similar to GPipe but with microbatches)
 5. Async (Don't synchronize forward/backward passes)
 """
@@ -155,8 +165,72 @@ def run_pipe(inputs, targets):
 
 # ---------- 9. Dummy data and run ----------
 if __name__ == "__main__":
-    for epoch in range(10):
+    import argparse
+    import time
+    import json
+
+    parser = argparse.ArgumentParser(description="1F1B Pipeline Parallelism Training")
+    parser.add_argument("--num-epochs", type=int, default=10, help="Number of training epochs")
+    args = parser.parse_args()
+
+    losses = []
+    epoch_times = []
+
+    # Track peak memory per GPU
+    torch.cuda.reset_peak_memory_stats()
+
+    print(f"[1F1B] Starting training for {args.num_epochs} epochs")
+    print(f"[1F1B] Config: {n_stages} stages, {n_micro} microbatches, batch_size={batch_size}")
+
+    start_time = time.time()
+    for epoch in range(args.num_epochs):
         x = torch.randn(batch_size, 50)
         y = torch.randn(batch_size, 50)
+
+        for i in range(n_stages):
+            torch.cuda.synchronize(i)
+        epoch_start = time.time()
+
         loss = run_pipe(x, y)
-        print(f"epoch {epoch}: loss = {loss:.4f}")
+
+        for i in range(n_stages):
+            torch.cuda.synchronize(i)
+        epoch_end = time.time()
+
+        epoch_time = epoch_end - epoch_start
+        losses.append(loss)
+        epoch_times.append(epoch_time)
+
+        if epoch % max(1, args.num_epochs // 10) == 0 or epoch == args.num_epochs - 1:
+            print(f"[1F1B] epoch {epoch}/{args.num_epochs}: loss={loss:.6f}, time={epoch_time:.3f}s")
+
+    total_time = time.time() - start_time
+
+    # Get peak memory for each GPU
+    peak_memory_mb = {i: torch.cuda.max_memory_allocated(i) / 1024**2 for i in range(n_stages)}
+
+    # Calculate metrics
+    avg_loss = sum(losses) / len(losses)
+    avg_epoch_time = sum(epoch_times) / len(epoch_times)
+
+    # Output results
+    results = {
+        "strategy": "1F1B",
+        "num_epochs": args.num_epochs,
+        "n_stages": n_stages,
+        "n_microbatches": n_micro,
+        "batch_size": batch_size,
+        "final_loss": losses[-1],
+        "avg_loss": avg_loss,
+        "total_time_sec": total_time,
+        "avg_epoch_time_sec": avg_epoch_time,
+        "throughput_epochs_per_sec": 1 / avg_epoch_time,
+        "peak_memory_mb": peak_memory_mb,
+        "total_peak_memory_mb": sum(peak_memory_mb.values()),
+    }
+
+    print("\n" + "="*60)
+    print("1F1B RESULTS")
+    print("="*60)
+    print(json.dumps(results, indent=2))
+    print("="*60)

@@ -10,7 +10,8 @@ Built for learning with velocity, not polish. Expect hacks.
 
 - [torch.distributed.barrier](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.barrier) is implemented as an all_reduce of a 1-element tensor
     - https://github.com/pytorch/pytorch/pull/140785: will show as `nccl:all_reduce_barrier` in the future
-
+- MoE parallel folding to reduce replicated work during dense layers: data shard across combined DPxEP mesh or reuse ep axis for another model parallel axis (ie tp/sp).
+	- https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/moe.html#moe-parallel-folding
 
 ### Zero
 - zero1.py with standard Adam: 5 nccl:all_reduce from barrier calls
@@ -30,3 +31,6 @@ Built for learning with velocity, not polish. Expect hacks.
     - gradient at the start of backward
         - `aten::nll_loss_backward` allocates grad wrt log probs (~4GB)
         - `attn::log_softmax_backward_data` calculates grad wrt logits (~4GB, can reuse) and frees log probs and grad wrt log probs
+
+### PP
+- 1f1b has scheduling overhead for small models. Clock-based scheduler polls all stages every tick, most checks find empty queues. GPipe's sequential phase execution is simpler. Trade-off reverses at scale: 1F1B's memory efficiency (peak ~n_stages vs ~n_microbatches activations) dominates when compute >> scheduling. 

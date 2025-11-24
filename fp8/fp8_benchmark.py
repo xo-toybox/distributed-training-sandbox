@@ -97,7 +97,7 @@ def main():
 
     model = AutoModelForCausalLM.from_config(
         AutoConfig.from_pretrained(args.model_name, use_cache=False),
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -118,6 +118,7 @@ def main():
     performance_tracker = PerformanceTracker(warmup_steps=5)
 
     logs = []
+    all_metrics = []  # Store all metrics for summary
     for step, batch in enumerate(dataloader):
         if step >= total_num_steps:
             break
@@ -136,6 +137,7 @@ def main():
 
         elif metrics:
             print_msg += performance_tracker.get_print_message(metrics)
+            all_metrics.append(metrics)  # Save metrics for summary
 
         if step % 10 == 0 or step == total_num_steps - 1:
             accelerator.print(print_msg)
@@ -147,8 +149,43 @@ def main():
     accelerator.end_training()
     accelerator.print("Training completed!")
     if accelerator.is_main_process:
-        with open(f"{args.model_name.replace('/','_').replace('-', '_').replace('.','_')}_{args.precision}_seqlen_{args.sequence_length}_{accelerator.num_processes}_gpus.txt", "w") as f:
+        import os
+        import json
+        trace_dir = os.environ.get("TRACE_DIR", ".")
+
+        # Save text logs (for easy viewing)
+        output_file = os.path.join(trace_dir, f"{args.model_name.replace('/','_').replace('-', '_').replace('.','_')}_{args.precision}_seqlen_{args.sequence_length}_{accelerator.num_processes}_gpus.txt")
+        with open(output_file, "w") as f:
             f.write("\n".join(logs))
+
+        # Save summary metrics (for analysis)
+        summary_file = os.path.join(trace_dir, f"summary_{args.model_name.replace('/','_').replace('-', '_').replace('.','_')}_{args.precision}_seqlen_{args.sequence_length}_{accelerator.num_processes}_gpus.json")
+        summary = {
+            "model_name": args.model_name,
+            "precision": args.precision,
+            "sequence_length": args.sequence_length,
+            "num_gpus": accelerator.num_processes,
+            "num_steps": total_num_steps,
+            "gpu_type": os.environ.get("MODAL_GPU_TYPE", "unknown"),
+        }
+
+        # Extract final metrics from collected metrics
+        if all_metrics:
+            final_metrics = all_metrics[-1]
+            summary["steps_per_second"] = final_metrics.get("steps_per_second", 0)
+            summary["tokens_per_second"] = final_metrics.get("tokens_per_second", 0)
+            summary["tflops"] = final_metrics.get("tflops_per_device", 0)
+
+            # Add memory metrics
+            summary["peak_memory_active_gb"] = final_metrics.get("peak_memory_active", 0)
+            summary["peak_memory_alloc_gb"] = final_metrics.get("peak_memory_alloc", 0)
+            summary["peak_memory_reserved_gb"] = final_metrics.get("peak_memory_reserved", 0)
+
+        with open(summary_file, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        accelerator.print(f"Results saved to: {output_file}")
+        accelerator.print(f"Summary saved to: {summary_file}")
 
 
 if __name__ == "__main__":

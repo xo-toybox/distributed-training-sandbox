@@ -13,7 +13,7 @@ MODEL_NAME = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 def get_smol_model():
     return AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=2, torch_dtype="bfloat16"
+        MODEL_NAME, num_labels=2, dtype="bfloat16"
     )
 
 
